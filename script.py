@@ -27,7 +27,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-# Force fully-offline behaviour before any HF/ultralytics imports touch the network.
+# Fully offline: model/config.json explicitly specifies backbone_config,
+# so transformers never needs to resolve an ambiguous backbone name via
+# the Hub API. Safe to enforce strict offline mode.
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
@@ -83,7 +85,7 @@ class Config:
         if self.output_dir is None:
             self.output_dir = self.base_dir / "output"
         if self.model_path is None:
-            self.model_path = self.base_dir / "model" / "yolov8s.pt"
+            self.model_path = self.base_dir / "model" / "conditional-detr-signature"
 
     @property
     def sig_images_dir(self) -> Path:
@@ -207,30 +209,36 @@ def prepare_image(path: Path, cfg: Config) -> PreparedImage:
 # ==========================================================================
 # Inference
 # ==========================================================================
-def run_inference_batch(model, prepared_images: list[PreparedImage], cfg: Config):
-    """Run YOLO on a batch of already-preprocessed images in one predict()
-    call (more efficient than one-at-a-time on CPU once volume grows).
+def run_inference_batch(model, processor, prepared_images: list[PreparedImage], cfg: Config):
+    """Run Conditional-DETR on a batch of already-preprocessed images in one
+    forward pass (more efficient than one-at-a-time on CPU once volume grows).
     Returns a list of detection-lists, aligned by index with prepared_images.
     Boxes are in the *preprocessed* image's pixel coordinates — annotation
     and cropping happen on that same preprocessed image, so no coordinate
-    remapping back to the original scan is needed (see process_batch)."""
+    remapping back to the original scan is needed (see process_batch).
+
+    Note: DETR-family models are set-based predictors (no NMS step), so
+    cfg.iou and cfg.imgsz (both YOLO-specific knobs) are not used here;
+    the processor handles resizing internally.
+    """
+    import torch
+
     sources = [p.image for p in prepared_images]
-    results = model.predict(
-        source=sources,
-        conf=cfg.conf_logging_floor,
-        iou=cfg.iou,
-        imgsz=cfg.imgsz,
-        verbose=False,
+    inputs = processor(images=sources, return_tensors="pt")
+    with torch.no_grad():
+        outputs = model(**inputs)
+
+    target_sizes = torch.tensor([p.image.size[::-1] for p in prepared_images])
+    results = processor.post_process_object_detection(
+        outputs, target_sizes=target_sizes, threshold=cfg.conf_logging_floor
     )
+
     all_detections = []
     for r in results:
         detections = []
-        boxes = r.boxes
-        if boxes is not None:
-            for box in boxes:
-                xyxy = tuple(box.xyxy[0].tolist())
-                conf = float(box.conf[0])
-                detections.append({"confidence": conf, "box": xyxy})
+        for score, box in zip(r["scores"], r["boxes"]):
+            xyxy = tuple(box.tolist())
+            detections.append({"confidence": float(score), "box": xyxy})
         detections.sort(key=lambda d: d["confidence"], reverse=True)
         all_detections.append(detections)
     return all_detections
@@ -382,14 +390,18 @@ def run(cfg: Config):
     if not cfg.model_path.exists():
         raise FileNotFoundError(
             f"Model weights not found at {cfg.model_path}. "
-            f"See model/DOWNLOAD_INSTRUCTIONS.md to fetch yolov8s.pt first."
+            f"Run: huggingface-cli download tech4humans/conditional-detr-50-signature-detector "
+            f"--local-dir {cfg.model_path}"
         )
 
     cfg.sig_images_dir.mkdir(parents=True, exist_ok=True)
 
-    from ultralytics import YOLO  # deferred import: keeps --help fast, avoids
-                                   # loading torch/ultralytics just to print usage
-    model = YOLO(str(cfg.model_path))
+    from transformers import AutoImageProcessor, AutoModelForObjectDetection  # deferred
+                                   # import: keeps --help fast, avoids loading torch/
+                                   # transformers just to print usage
+    processor = AutoImageProcessor.from_pretrained(str(cfg.model_path))
+    model = AutoModelForObjectDetection.from_pretrained(str(cfg.model_path))
+    model.eval()
 
     image_paths = sorted(
         p for p in cfg.upload_dir.iterdir() if p.suffix.lower() in VALID_EXTENSIONS
@@ -408,7 +420,7 @@ def run(cfg: Config):
             continue
 
         t0 = time.perf_counter()
-        detections_batch = run_inference_batch(model, prepared, cfg)
+        detections_batch = run_inference_batch(model, processor, prepared, cfg)
         elapsed_ms_total = (time.perf_counter() - t0) * 1000
         elapsed_ms_each = elapsed_ms_total / len(prepared)
 
