@@ -1,6 +1,6 @@
 """
 Signature Detection Model Test
-tech4humans/yolov8s-signature-detector — CPU-only, offline, stand-alone test script.
+mdefrance/yolos-tiny-signature-detection — CPU-only, offline, stand-alone test script.
 
 See signature-detection-test-project.md / signature-detection-test-plan.md for full context.
 
@@ -27,9 +27,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-# Fully offline: model/config.json explicitly specifies backbone_config,
-# so transformers never needs to resolve an ambiguous backbone name via
-# the Hub API. Safe to enforce strict offline mode.
+# Fully offline: YOLOS is a pure Vision Transformer (no separate CNN backbone
+# to resolve, unlike Conditional-DETR/ResNet), so transformers never needs
+# to make any network call to load it. Safe to enforce strict offline mode.
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
@@ -85,7 +85,7 @@ class Config:
         if self.output_dir is None:
             self.output_dir = self.base_dir / "output"
         if self.model_path is None:
-            self.model_path = self.base_dir / "model" / "conditional-detr-signature"
+            self.model_path = self.base_dir / "model" / "yolos-tiny-signature"
 
     @property
     def sig_images_dir(self) -> Path:
@@ -217,9 +217,9 @@ def run_inference_batch(model, processor, prepared_images: list[PreparedImage], 
     and cropping happen on that same preprocessed image, so no coordinate
     remapping back to the original scan is needed (see process_batch).
 
-    Note: DETR-family models are set-based predictors (no NMS step), so
-    cfg.iou and cfg.imgsz (both YOLO-specific knobs) are not used here;
-    the processor handles resizing internally.
+    Note: transformer-based detectors like YOLOS are set-based predictors
+    (no NMS step), so cfg.iou and cfg.imgsz (both YOLO-specific knobs) are
+    not used here; the processor handles resizing internally.
     """
     import torch
 
@@ -390,7 +390,7 @@ def run(cfg: Config):
     if not cfg.model_path.exists():
         raise FileNotFoundError(
             f"Model weights not found at {cfg.model_path}. "
-            f"Run: huggingface-cli download tech4humans/conditional-detr-50-signature-detector "
+            f"Run: hf download mdefrance/yolos-tiny-signature-detection "
             f"--local-dir {cfg.model_path}"
         )
 
